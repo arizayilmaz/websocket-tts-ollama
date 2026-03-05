@@ -1,0 +1,46 @@
+services:
+  ws-gateway:
+    build:
+      context: ./services/ws-gateway
+    env_file:
+      - ./.env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - ollama
+      - piper
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+      
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      - ollama
+    env_file:
+      - ./.env
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      - ollama:/root/.ollama
+    entrypoint:
+      ["sh", "-lc", "until ollama list >/dev/null 2>&1; do sleep 1; done; ollama pull \"$OLLAMA_MODEL\""]
+    restart: "no"
+
+  piper:
+    build:
+      context: ./services/piper-service
+    env_file:
+      - ./.env
+    ports:
+      - "5000:5000"
+    volumes:
+      - piper_cache:/models
+
+volumes:
+  ollama:
+  piper_cache:
