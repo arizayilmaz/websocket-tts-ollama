@@ -18,6 +18,7 @@ build/
 venv/
 ENV/
 env/
+services/.venv/
 
 # --- IDE / Editor ---
 .vscode/
@@ -35,3 +36,10 @@ desktop.ini
 # --- Local data / caches ---
 models/
 .cache/
+node_modules/
+ui/node_modules/
+untitled/node_modules/
+coverage/
+untitled/
+ui/dist/
+.pytest_cache/

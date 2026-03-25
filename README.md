@@ -1,178 +1,170 @@
 # websocket-tts-ollama
 
-FastAPI + Uvicorn WebSocket gateway üzerinden gelen metni (opsiyonel) **Ollama** ile normalize eder, **Piper** ile TTS üretir ve sesi **~100ms PCM (pcm_s16le) binary chunk**’lar halinde WebSocket üzerinden stream eder.
+FastAPI tabanli WebSocket gateway, gelen metni segmentlere ayirir, opsiyonel olarak Ollama ile normalize eder, Piper ile WAV uretir ve sesi PCM chunk olarak stream eder.
 
----
+## Durum
+Bu repo artik temel urunlesme kontrollerine sahip:
 
-## Mimari (Docker Compose)
-- **ws-gateway** (FastAPI WebSocket)
-  - WS endpoint: `ws://localhost:8000/ws/tts`
-  - Akış: `append/flush/end/stop` → segmentleme → (ops) Ollama normalize → Piper TTS → PCM chunk stream
-- **ollama** (LLM)
-  - Normalize için kullanılır
-- **piper** (TTS)
-  - HTTP üzerinden WAV üretir, gateway PCM chunk’lara çevirip WS üzerinden yollar
-- **ollama-pull** (init job)
-  - Modeli indirir, tamamlayınca kapanır (Exited normal)
+- request lifecycle websocket baglantisi icinde netlestirildi
+- `stop` ve yeni request aktif segment taskini gercekten iptal ediyor
+- stale audio eski request icin cliente gitmiyor
+- bounded queue ile backpressure eklendi
+- config validation, timeout, retry ve structured logging eklendi
+- `/health` ve dependency-aware `/ready` ayrimi eklendi
+- websocket loglarinda `connection_id` korelasyonu eklendi
 
----
+## Mimari
+- `ws-gateway`
+  - endpoint: `ws://localhost:8000/ws/tts`
+  - sorumluluk: websocket IO, request session lifecycle, segment queue orchestration
+- `ollama`
+  - opsiyonel text normalization
+- `piper`
+  - HTTP uzerinden WAV uretimi
+- `ollama-pull`
+  - model warm-up/init container
 
-## Proje Yapısı
-```
+Gateway akisi:
+
+`append/flush/end/stop` -> `ConnectionSession` -> bounded segment queue -> Ollama normalize -> Piper WAV -> PCM chunk stream
+
+## Proje Yapisi
+```text
 websocket-tts-ollama/
   docker-compose.yml
-  .env
+  README.md
   services/
     ws-gateway/
-      Dockerfile
       requirements.txt
       app/
+        config.py
+        logging_utils.py
         main.py
+        session.py
+        ws_handler.py
         protocol.py
         splitter.py
         audio_chunker.py
         clients/
           ollama.py
           piper_http.py
+      tests/
+        test_config.py
+        test_session.py
     piper-service/
       Dockerfile
       start.sh
 ```
 
----
-
-## Gereksinimler
-- Docker Desktop
-- Portlar boş olmalı:
-  - `8000` (ws-gateway)
-  - `5000` (piper)
-  - `11434` (ollama)
-
----
-
-## .env Dosyası
-Proje root dizinine `.env` oluştur ve aşağıdaki gibi doldur:
+## Konfigurasyon
+Root `.env` dosyasi:
 
 ```env
-# ws-gateway
 CHUNK_MS=100
 USE_OLLAMA=true
-
-# Docker network içinde servis isimleri
 OLLAMA_BASE_URL=http://ollama:11434/api
 PIPER_BASE_URL=http://piper:5000
-
-# Ollama
 OLLAMA_MODEL=gemma3
-
-# Piper
+SEGMENT_QUEUE_SIZE=8
+REQUEST_TIMEOUT_SECONDS=30
+CONNECT_TIMEOUT_SECONDS=5
+PIPER_RETRIES=1
+OLLAMA_RETRIES=1
+LOG_LEVEL=INFO
 PIPER_VOICE=en_US-lessac-medium
 PIPER_PORT=5000
 ```
 
----
+Validation kurallari:
+- `CHUNK_MS`: `20-1000`
+- `SEGMENT_QUEUE_SIZE`: `1-128`
+- timeout ve retry degerleri pozitif olmali
+- `LOG_LEVEL`: `DEBUG|INFO|WARNING|ERROR|CRITICAL`
 
-## Çalıştırma
-Proje root dizininde:
+Gecersiz config ile servis startup'ta fail eder.
 
-```bash
-docker compose up --build
-```
+## WebSocket Protokolu
+Client -> Server:
+- `{"type":"append","request_id":"r1","text":"..."}`
+- `{"type":"flush","request_id":"r1"}`
+- `{"type":"end","request_id":"r1"}`
+- `{"type":"stop","request_id":"r1"}`
 
-Durum kontrol:
-```bash
-docker compose ps
-```
-
-Beklenen:
-- `ws-gateway` → Up
-- `ollama` → Up
-- `piper` → Up
-- `ollama-pull` → `Exited(0)` olabilir (model indirip kapanması normal)
-
----
-
-## Hızlı Testler
-
-### 1) Gateway health
-Tarayıcı:
-- `http://localhost:8000/health`
-
-Beklenen:
-```json
-{"ok": true}
-```
-
-### 2) Piper HTTP testi (WAV)
-Postman:
-- **POST** `http://localhost:5000/`
-- Body (raw JSON):
-```json
-{"text":"Merhaba! Piper HTTP test."}
-```
-Response binary gelir → “Save Response” ile `.wav` kaydedip dinleyebilirsin.
-
-Curl:
-```bash
-curl -X POST -H "Content-Type: application/json" \
-  -d '{ "text": "Merhaba! Piper HTTP test." }' \
-  -o test.wav http://localhost:5000/
-```
-
-### 3) WebSocket TTS testi (Postman)
-> Postman ses çalmaz, sadece JSON + Binary frame’leri gösterir.
-
-Postman → New → **WebSocket Request**  
-URL: `ws://localhost:8000/ws/tts`
-
-Bağlanınca ilk mesaj:
-- `audio_format`
-
-Gönder:
-```json
-{"type":"append","text":"Merhaba! WebSocket üzerinden TTS testi."}
-```
-Ardından:
-```json
-{"type":"flush"}
-```
-
-Beklenen akış:
-- `segment_ready`
-- `audio_start`
-- birden fazla `audio_chunk` + her chunk sonrası **Binary**
-- `audio_end`
-
----
-
-## WebSocket Protokol Özeti
-Client → Server (JSON):
-- `{"type":"append","text":"..."}`
-- `{"type":"flush"}`
-- `{"type":"end"}`
-- `{"type":"stop"}`
-
-Server → Client (JSON):
+Server -> Client:
 - `audio_format`
 - `buffer_status`
 - `segment_ready`
 - `audio_start`
 - `audio_chunk`
 - `audio_end`
+- `warning`
 - `error`
 
-**Kural:** Her `audio_chunk` JSON mesajını **takiben** bir **binary frame** gelir.  
-Binary içerik: **PCM s16le** chunk bytes (CHUNK_MS=100 ise 100ms).
+Kurallar:
+- Her `audio_chunk` JSON mesajini hemen bir binary PCM frame takip eder.
+- Yeni `request_id` geldiyse eski aktif request iptal edilir.
+- `stop` sonrasinda kuyruktaki segmentler bosaltilir ve aktif segment taski iptal edilir.
+- Queue dolarsa request hata ile iptal edilir.
 
----
+## Calistirma
+```bash
+docker compose up --build
+```
+
+Health:
+```bash
+curl http://localhost:8000/health
+```
+
+Beklenen response artik queue bilgisini de icerir:
+```json
+{
+  "ok": true,
+  "segment_queue_size": 8
+}
+```
+
+Readiness:
+```bash
+curl http://localhost:8000/ready
+```
+
+Beklenen response:
+```json
+{
+  "ok": true,
+  "dependencies": {
+    "piper": true,
+    "ollama": true
+  }
+}
+```
+
+## Testler
+Python testleri:
+
+```bash
+cd services/ws-gateway
+pytest
+```
+
+Kapsanan temel senaryolar:
+- config validation
+- `stop` ile aktif request iptali
+- yeni request gelince eski request iptali
+- queue full durumunda backpressure hata akisi
+- websocket endpoint uzerinden JSON/binary frame sirasi
+- invalid websocket payload rejection
+- readiness endpoint dependency durumu
+
+## Operasyonel Notlar
+- Logging JSON formatinda stdout'a yazar.
+- WebSocket connection loglarinda `connection_id` bulunur.
+- Ollama ve Piper clientlari reuse edilen `httpx.AsyncClient` kullanir.
+- Timeout ve retry sinirlari env ile yonetilir.
+- Docker Compose servislerinde healthcheck ve `restart: unless-stopped` tanimlidir.
 
 ## Troubleshooting
-### `/ws/tts` 404
-`/ws/tts` bir HTTP endpoint değil **WebSocket endpoint**. Tarayıcıda açarsan 404 normaldir. Postman WebSocket veya WS client kullan.
+`/ws/tts` bir HTTP endpoint degildir; browserda 404 gormen normaldir.
 
-### Piper container restart ediyor
-Log:
-```bash
-docker compose logs -f piper
-```
-Windows’ta sık sebep: `start.sh` CRLF → dosyayı LF’ye çevir (VS Code: CRLF → LF).
+Piper container Windows tarafinda restart ediyorsa once `services/piper-service/start.sh` dosyasinin LF formatinda oldugunu kontrol et.

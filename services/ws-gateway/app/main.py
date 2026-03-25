@@ -1,121 +1,105 @@
-import asyncio
-import os
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from .splitter import Splitter
-from .clients.piper_http import PiperHttpClient
+import httpx
+from contextlib import asynccontextmanager
+from typing import Awaitable, Callable, Optional
+
+from fastapi import FastAPI, WebSocket
+
 from .clients.ollama import OllamaClient
-from .audio_chunker import wav_to_pcm_chunks
+from .clients.piper_http import PiperHttpClient
+from .config import load_settings
+from .logging_utils import setup_logging
+from .readiness import tcp_ready
+from .session import ConnectionSession
+from .splitter import Splitter
+from .ws_handler import new_connection_id, serve_tts_websocket
 
-app = FastAPI()
+settings = load_settings()
+setup_logging(settings.log_level)
 
-PIPER_BASE_URL = os.getenv("PIPER_BASE_URL", "http://localhost:5000")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/api")
-USE_OLLAMA = os.getenv("USE_OLLAMA", "false").lower() == "true"
-CHUNK_MS = int(os.getenv("CHUNK_MS", "100"))
 
-splitter = Splitter()
-piper = PiperHttpClient(PIPER_BASE_URL)
-ollama = OllamaClient(OLLAMA_BASE_URL)
+def create_app(
+    app_settings=None,
+    splitter: Optional[Splitter] = None,
+    piper: Optional[PiperHttpClient] = None,
+    ollama: Optional[OllamaClient] = None,
+    readiness_probe: Optional[Callable[[str, float], Awaitable[bool]]] = None,
+) -> FastAPI:
+    active_settings = app_settings or settings
+    probe = readiness_probe or tcp_ready
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        timeout = httpx.Timeout(
+            timeout=active_settings.request_timeout_seconds,
+            connect=active_settings.connect_timeout_seconds,
+        )
+        app.state.settings = active_settings
+        app.state.splitter = splitter or Splitter()
+        app.state.piper = piper or PiperHttpClient(
+            active_settings.piper_base_url,
+            timeout=timeout,
+            retries=active_settings.piper_retries,
+        )
+        app.state.ollama = ollama or OllamaClient(
+            active_settings.ollama_base_url,
+            model=active_settings.ollama_model,
+            timeout=timeout,
+            retries=active_settings.ollama_retries,
+        )
+        yield
+        if hasattr(app.state.piper, "aclose"):
+            await app.state.piper.aclose()
+        if hasattr(app.state.ollama, "aclose"):
+            await app.state.ollama.aclose()
 
-@app.websocket("/ws/tts")
-async def ws_tts(websocket: WebSocket):
-    await websocket.accept()
+    app = FastAPI(lifespan=lifespan)
 
-    buffer = ""
-    segment_order = 0
-    stopped = asyncio.Event()
+    @app.get("/health")
+    def health():
+        return {
+            "ok": True,
+            "piper_base_url": active_settings.piper_base_url,
+            "ollama_base_url": active_settings.ollama_base_url,
+            "use_ollama": active_settings.use_ollama,
+            "chunk_ms": active_settings.chunk_ms,
+            "segment_queue_size": active_settings.segment_queue_size,
+        }
 
-    # İlk format bilgisini gönder (POC: WAV->PCM chunk yapacağız, client'a PCM formatını söyle)
-    await websocket.send_json({
-        "type": "audio_format",
-        "encoding": "pcm_s16le",
-        "sample_rate": 22050,
-        "channels": 1,
-        "sample_width": 2
-    })
+    @app.get("/ready")
+    async def ready():
+        piper_ready = await probe(
+            active_settings.piper_base_url,
+            active_settings.connect_timeout_seconds,
+        )
+        ollama_ready = True
+        if active_settings.use_ollama:
+            ollama_ready = await probe(
+                active_settings.ollama_base_url,
+                active_settings.connect_timeout_seconds,
+            )
 
-    async def handle_segment(text: str, segment_id: str, order: int):
-        # 1) opsiyonel normalize
-        norm = text
-        if USE_OLLAMA:
-            norm = await ollama.normalize(text)
+        ready_state = piper_ready and ollama_ready
+        return {
+            "ok": ready_state,
+            "dependencies": {
+                "piper": piper_ready,
+                "ollama": ollama_ready if active_settings.use_ollama else "disabled",
+            },
+        }
 
-        await websocket.send_json({
-            "type": "segment_ready",
-            "segment_id": segment_id,
-            "order": order,
-            "text": text,
-            "normalized_text": norm if USE_OLLAMA else None
-        })
+    @app.websocket("/ws/tts")
+    async def ws_tts(websocket: WebSocket):
+        session = ConnectionSession(
+            websocket=websocket,
+            connection_id=new_connection_id(),
+            settings=websocket.app.state.settings,
+            splitter=websocket.app.state.splitter,
+            piper=websocket.app.state.piper,
+            ollama=websocket.app.state.ollama,
+        )
+        await serve_tts_websocket(websocket, session)
 
-        if stopped.is_set():
-            return
+    return app
 
-        # 2) TTS (Piper HTTP -> WAV bytes)
-        wav_bytes = await piper.synthesize_wav(norm)
 
-        await websocket.send_json({"type": "audio_start", "segment_id": segment_id})
-
-        # 3) WAV -> PCM chunk’ları (~100ms) ve WS üstünden gönder
-        chunk_seq = 0
-        async for pcm_chunk in wav_to_pcm_chunks(wav_bytes, chunk_ms=CHUNK_MS):
-            if stopped.is_set():
-                return
-
-            await websocket.send_json({
-                "type": "audio_chunk",
-                "segment_id": segment_id,
-                "chunk_seq": chunk_seq,
-                "byte_length": len(pcm_chunk)
-            })
-            # audio_chunk JSON’dan sonra gelen next frame binary bytes olmalı
-            await websocket.send_bytes(pcm_chunk)
-            chunk_seq += 1
-
-        await websocket.send_json({"type": "audio_end", "segment_id": segment_id})
-
-    try:
-        while True:
-            msg = await websocket.receive_json()
-
-            mtype = msg.get("type")
-            if mtype == "append":
-                buffer += (msg.get("text") or "")
-                await websocket.send_json({
-                    "type": "buffer_status",
-                    "buffer_len": len(buffer),
-                    "queued_segments": 0
-                })
-
-                # Buffer’dan çıkarılabilir segment var mı?
-                segments, buffer = splitter.pop_ready_segments(buffer)
-                for seg in segments:
-                    segment_id = f"s{segment_order}"
-                    asyncio.create_task(handle_segment(seg, segment_id, segment_order))
-                    segment_order += 1
-
-            elif mtype in ("flush", "end"):
-                # Nokta beklemeden fallback segment üret
-                segments, buffer = splitter.flush_all(buffer)
-                for seg in segments:
-                    segment_id = f"s{segment_order}"
-                    asyncio.create_task(handle_segment(seg, segment_id, segment_order))
-                    segment_order += 1
-
-            elif mtype == "stop":
-                stopped.set()
-                buffer = ""
-                await websocket.send_json({"type": "buffer_status", "buffer_len": 0, "queued_segments": 0})
-
-            else:
-                await websocket.send_json({
-                    "type": "warning",
-                    "message": f"Unknown message type: {mtype}"
-                })
-
-    except WebSocketDisconnect:
-        stopped.set()
+app = create_app()
